@@ -3,14 +3,18 @@ package server
 import (
 	"bufio"
 	"fmt"
-	"github.com/code-100-precent/LingCache/persistence"
-	"github.com/code-100-precent/LingCache/protocol"
-	"github.com/code-100-precent/LingCache/storage"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/code-100-precent/LingCache/cluster"
+	"github.com/code-100-precent/LingCache/persistence"
+	"github.com/code-100-precent/LingCache/protocol"
+	"github.com/code-100-precent/LingCache/replication"
+	"github.com/code-100-precent/LingCache/storage"
 )
 
 /*
@@ -27,21 +31,24 @@ import (
 
 // Server Redis 服务器
 type Server struct {
-	addr          string
-	redisServer   *storage.RedisServer
-	cmdTable      *CommandTable
-	listener      net.Listener
-	clients       map[*Client]bool
-	pubsub        *PubSubManager
-	stats         *Stats
-	blockingMgr   *BlockingManager
-	aofWriter     *persistence.AOFWriter
-	sharedObjects *SharedObjects
-	memoryStats   *MemoryStats
-	rdbFilename   string
-	aofFilename   string
-	mu            sync.RWMutex
-	running       bool
+	addr           string
+	redisServer    *storage.RedisServer
+	cmdTable       *CommandTable
+	listener       net.Listener
+	clients        map[*Client]bool
+	pubsub         *PubSubManager
+	stats          *Stats
+	blockingMgr    *BlockingManager
+	aofWriter      *persistence.AOFWriter
+	sharedObjects  *SharedObjects
+	memoryStats    *MemoryStats
+	rdbFilename    string
+	aofFilename    string
+	master         *replication.Master // 主节点（如果当前节点是主节点）
+	cluster        *cluster.Cluster    // 集群（如果启用集群模式）
+	clusterEnabled bool                // 是否启用集群模式
+	mu             sync.RWMutex
+	running        bool
 }
 
 // Client 客户端连接
@@ -60,25 +67,49 @@ type Client struct {
 
 // NewServer 创建新的服务器
 func NewServer(addr string, dbnum int) *Server {
+	redisServer := storage.NewRedisServer(dbnum)
 	server := &Server{
-		addr:          addr,
-		redisServer:   storage.NewRedisServer(dbnum),
-		cmdTable:      NewCommandTable(),
-		clients:       make(map[*Client]bool),
-		pubsub:        NewPubSubManager(),
-		stats:         NewStats(),
-		blockingMgr:   NewBlockingManager(),
-		sharedObjects: NewSharedObjects(),
-		memoryStats:   NewMemoryStats(),
-		rdbFilename:   "dump.rdb",
-		aofFilename:   "appendonly.aof",
-		running:       false,
+		addr:           addr,
+		redisServer:    redisServer,
+		cmdTable:       NewCommandTable(),
+		clients:        make(map[*Client]bool),
+		pubsub:         NewPubSubManager(),
+		stats:          NewStats(),
+		blockingMgr:    NewBlockingManager(),
+		sharedObjects:  NewSharedObjects(),
+		memoryStats:    NewMemoryStats(),
+		rdbFilename:    "dump.rdb",
+		aofFilename:    "appendonly.aof",
+		master:         replication.NewMaster(redisServer), // 默认作为主节点
+		clusterEnabled: false,
+		running:        false,
 	}
 
 	// 启动定期清理过期阻塞客户端
 	go server.cleanBlockingClients()
 
 	return server
+}
+
+// InitCluster 初始化集群（如果启用）
+func (s *Server) InitCluster(clusterEnabled bool, nodeID string, clusterAddr string) error {
+	if !clusterEnabled {
+		return nil
+	}
+
+	if nodeID == "" {
+		nodeID = fmt.Sprintf("node-%s", strings.ReplaceAll(s.addr, ":", "-"))
+	}
+
+	if clusterAddr == "" {
+		clusterAddr = s.addr
+	}
+
+	s.cluster = cluster.NewCluster(s.redisServer, nodeID, clusterAddr)
+	s.clusterEnabled = true
+
+	fmt.Printf("Cluster initialized: nodeID=%s, addr=%s\n", nodeID, clusterAddr)
+	return nil
 }
 
 // InitAOF 初始化 AOF（如果启用）
@@ -322,6 +353,17 @@ func (s *Server) handleClient(client *Client) {
 		}
 
 		// 正常模式：执行命令
+		// 如果是集群模式，先检查路由
+		if s.clusterEnabled && s.cluster != nil {
+			// 检查是否需要路由到其他节点
+			if redirectResp := s.checkClusterRedirect(ctx, req); redirectResp != nil {
+				if err := client.writeResponse(redirectResp); err != nil {
+					return
+				}
+				continue
+			}
+		}
+
 		startTime := time.Now()
 		resp := s.cmdTable.ExecuteCommand(ctx, req)
 		duration := time.Since(startTime)
@@ -339,6 +381,11 @@ func (s *Server) handleClient(client *Client) {
 					// AOF 写入失败，记录错误但不影响命令执行
 					fmt.Printf("AOF write error: %v\n", err)
 				}
+			}
+
+			// 如果是写命令且是主节点，传播到从节点
+			if s.master != nil && s.isWriteCommand(cmdName) && resp != nil && resp.Type != protocol.RESP_ERROR {
+				s.master.PropagateCommand(req)
 			}
 		}
 
@@ -378,15 +425,21 @@ func (c *Client) Close() {
 // isWriteCommand 判断是否是写命令
 func (s *Server) isWriteCommand(cmdName string) bool {
 	writeCommands := map[string]bool{
-		"SET": true, "MSET": true, "SETEX": true, "SETNX": true,
-		"DEL": true, "EXPIRE": true, "EXPIREAT": true, "PERSIST": true,
+		"SET": true, "MSET": true, "SETEX": true, "SETNX": true, "PSETEX": true,
+		"DEL": true, "EXPIRE": true, "EXPIREAT": true, "PEXPIRE": true, "PEXPIREAT": true, "PERSIST": true,
+		"RENAME": true, "RENAMENX": true, "MOVE": true,
 		"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true,
-		"LREM": true, "LSET": true, "LTRIM": true,
-		"SADD": true, "SREM": true, "SPOP": true,
+		"LREM": true, "LSET": true, "LTRIM": true, "LINSERT": true,
+		"RPOPLPUSH": true, "BRPOPLPUSH": true,
+		"SADD": true, "SREM": true, "SPOP": true, "SMOVE": true,
+		"SINTERSTORE": true, "SUNIONSTORE": true, "SDIFFSTORE": true,
 		"ZADD": true, "ZREM": true, "ZINCRBY": true,
-		"HSET": true, "HMSET": true, "HDEL": true, "HINCRBY": true,
+		"ZREMRANGEBYRANK": true, "ZREMRANGEBYSCORE": true,
+		"HSET": true, "HMSET": true, "HDEL": true, "HINCRBY": true, "HINCRBYFLOAT": true, "HSETNX": true,
 		"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true,
-		"APPEND": true, "GETSET": true,
+		"APPEND": true, "GETSET": true, "SETRANGE": true,
+		"SETBIT": true, "BITOP": true,
+		"SORT": true,
 	}
 	return writeCommands[cmdName]
 }
@@ -394,4 +447,66 @@ func (s *Server) isWriteCommand(cmdName string) bool {
 // GetRedisServer 获取 Redis 服务器实例
 func (s *Server) GetRedisServer() *storage.RedisServer {
 	return s.redisServer
+}
+
+// GetCluster 获取集群实例
+func (s *Server) GetCluster() *cluster.Cluster {
+	return s.cluster
+}
+
+// checkClusterRedirect 检查是否需要重定向到其他节点
+func (s *Server) checkClusterRedirect(ctx *CommandContext, req *protocol.RESPValue) *protocol.RESPValue {
+	if !req.IsArray() || len(req.GetArray()) == 0 {
+		return nil
+	}
+
+	cmdArray := req.GetArray()
+	cmdName := cmdArray[0].ToString()
+	cmdName = toUpper(cmdName)
+
+	// 集群管理命令不需要路由
+	if cmdName == "CLUSTER" || cmdName == "PING" || cmdName == "INFO" {
+		return nil
+	}
+
+	// 计算键的槽号
+	var slot int = -1
+	if len(cmdArray) > 1 {
+		key := cmdArray[1].ToString()
+		slot = cluster.HashSlot(key)
+	}
+
+	// 如果无法计算槽号，直接执行（可能是无键命令）
+	if slot < 0 {
+		return nil
+	}
+
+	// 获取负责该槽的节点
+	slotNode := s.cluster.GetSlotNode(slot)
+	if slotNode == nil {
+		// 槽未分配，返回错误
+		return protocol.NewError(fmt.Sprintf("CLUSTERDOWN Hash slot not served"))
+	}
+
+	// 检查是否是当前节点
+	if slotNode.NodeID != s.cluster.GetMyself().NodeID {
+		// 需要重定向到其他节点
+		// 解析地址
+		addr := slotNode.Addr
+		host := "127.0.0.1"
+		port := "6379"
+
+		if strings.Contains(addr, ":") {
+			parts := strings.Split(addr, ":")
+			if len(parts) == 2 {
+				host = parts[0]
+				port = parts[1]
+			}
+		}
+
+		// 返回 MOVED 重定向
+		return protocol.NewError(fmt.Sprintf("MOVED %d %s:%s", slot, host, port))
+	}
+
+	return nil
 }

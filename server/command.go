@@ -124,6 +124,83 @@ func (ct *CommandTable) registerCommands() {
 	})
 
 	ct.Register(&Command{
+		Name:     "EXPIREAT",
+		Proc:     cmdExpireAt,
+		Arity:    3,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "PEXPIRE",
+		Proc:     cmdPExpire,
+		Arity:    3,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "PEXPIREAT",
+		Proc:     cmdPExpireAt,
+		Arity:    3,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "PTTL",
+		Proc:     cmdPTTL,
+		Arity:    2,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "PERSIST",
+		Proc:     cmdPersist,
+		Arity:    2,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "RENAME",
+		Proc:     cmdRename,
+		Arity:    3,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "RENAMENX",
+		Proc:     cmdRenameNx,
+		Arity:    3,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "RANDOMKEY",
+		Proc:     cmdRandomKey,
+		Arity:    1,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "MOVE",
+		Proc:     cmdMove,
+		Arity:    3,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "OBJECT",
+		Proc:     cmdObject,
+		Arity:    -2,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
+		Name:     "SORT",
+		Proc:     cmdSort,
+		Arity:    -2,
+		Category: "keyspace",
+	})
+
+	ct.Register(&Command{
 		Name:     "KEYS",
 		Proc:     cmdKeys,
 		Arity:    2,
@@ -208,6 +285,55 @@ func (ct *CommandTable) registerCommands() {
 		Category: "list",
 	})
 
+	ct.Register(&Command{
+		Name:     "LINDEX",
+		Proc:     cmdLIndex,
+		Arity:    3,
+		Category: "list",
+	})
+
+	ct.Register(&Command{
+		Name:     "LINSERT",
+		Proc:     cmdLInsert,
+		Arity:    5,
+		Category: "list",
+	})
+
+	ct.Register(&Command{
+		Name:     "LREM",
+		Proc:     cmdLRem,
+		Arity:    4,
+		Category: "list",
+	})
+
+	ct.Register(&Command{
+		Name:     "LSET",
+		Proc:     cmdLSet,
+		Arity:    4,
+		Category: "list",
+	})
+
+	ct.Register(&Command{
+		Name:     "LTRIM",
+		Proc:     cmdLTrim,
+		Arity:    4,
+		Category: "list",
+	})
+
+	ct.Register(&Command{
+		Name:     "RPOPLPUSH",
+		Proc:     cmdRPopLPush,
+		Arity:    3,
+		Category: "list",
+	})
+
+	ct.Register(&Command{
+		Name:     "BRPOPLPUSH",
+		Proc:     cmdBRPopLPush,
+		Arity:    4,
+		Category: "list",
+	})
+
 	// ========== Set 命令 ==========
 	ct.Register(&Command{
 		Name:     "SADD",
@@ -265,6 +391,48 @@ func (ct *CommandTable) registerCommands() {
 		Category: "set",
 	})
 
+	ct.Register(&Command{
+		Name:     "SPOP",
+		Proc:     cmdSPop,
+		Arity:    -2,
+		Category: "set",
+	})
+
+	ct.Register(&Command{
+		Name:     "SRANDMEMBER",
+		Proc:     cmdSRandMember,
+		Arity:    -2,
+		Category: "set",
+	})
+
+	ct.Register(&Command{
+		Name:     "SMOVE",
+		Proc:     cmdSMove,
+		Arity:    4,
+		Category: "set",
+	})
+
+	ct.Register(&Command{
+		Name:     "SINTERSTORE",
+		Proc:     cmdSInterStore,
+		Arity:    -3,
+		Category: "set",
+	})
+
+	ct.Register(&Command{
+		Name:     "SUNIONSTORE",
+		Proc:     cmdSUnionStore,
+		Arity:    -3,
+		Category: "set",
+	})
+
+	ct.Register(&Command{
+		Name:     "SDIFFSTORE",
+		Proc:     cmdSDiffStore,
+		Arity:    -3,
+		Category: "set",
+	})
+
 	// ========== ZSet 命令 ==========
 	ct.Register(&Command{
 		Name:     "ZADD",
@@ -305,6 +473,62 @@ func (ct *CommandTable) registerCommands() {
 		Name:     "ZRANK",
 		Proc:     cmdZRank,
 		Arity:    3,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZREVRANGE",
+		Proc:     cmdZRevRange,
+		Arity:    -4,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZREVRANK",
+		Proc:     cmdZRevRank,
+		Arity:    3,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZINCRBY",
+		Proc:     cmdZIncrBy,
+		Arity:    4,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZRANGEBYSCORE",
+		Proc:     cmdZRangeByScore,
+		Arity:    -4,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZCOUNT",
+		Proc:     cmdZCount,
+		Arity:    4,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZREVRANGEBYSCORE",
+		Proc:     cmdZRevRangeByScore,
+		Arity:    -4,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZREMRANGEBYRANK",
+		Proc:     cmdZRemRangeByRank,
+		Arity:    4,
+		Category: "sortedset",
+	})
+
+	ct.Register(&Command{
+		Name:     "ZREMRANGEBYSCORE",
+		Proc:     cmdZRemRangeByScore,
+		Arity:    4,
 		Category: "sortedset",
 	})
 
@@ -373,6 +597,48 @@ func (ct *CommandTable) registerCommands() {
 	})
 
 	ct.Register(&Command{
+		Name:     "HMSET",
+		Proc:     cmdHMSet,
+		Arity:    -4,
+		Category: "hash",
+	})
+
+	ct.Register(&Command{
+		Name:     "HMGET",
+		Proc:     cmdHMGet,
+		Arity:    -3,
+		Category: "hash",
+	})
+
+	ct.Register(&Command{
+		Name:     "HSETNX",
+		Proc:     cmdHSetNx,
+		Arity:    4,
+		Category: "hash",
+	})
+
+	ct.Register(&Command{
+		Name:     "HSTRLEN",
+		Proc:     cmdHStrLen,
+		Arity:    3,
+		Category: "hash",
+	})
+
+	ct.Register(&Command{
+		Name:     "HINCRBYFLOAT",
+		Proc:     cmdHIncrByFloat,
+		Arity:    4,
+		Category: "hash",
+	})
+
+	ct.Register(&Command{
+		Name:     "HSCAN",
+		Proc:     cmdHScan,
+		Arity:    -3,
+		Category: "hash",
+	})
+
+	ct.Register(&Command{
 		Name:     "MSET",
 		Proc:     cmdMSet,
 		Arity:    -3,
@@ -383,6 +649,125 @@ func (ct *CommandTable) registerCommands() {
 		Name:     "MGET",
 		Proc:     cmdMGet,
 		Arity:    -2,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "SETEX",
+		Proc:     cmdSetEx,
+		Arity:    4,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "SETNX",
+		Proc:     cmdSetNx,
+		Arity:    3,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "PSETEX",
+		Proc:     cmdPSetEx,
+		Arity:    4,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "GETSET",
+		Proc:     cmdGetSet,
+		Arity:    3,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "APPEND",
+		Proc:     cmdAppend,
+		Arity:    3,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "STRLEN",
+		Proc:     cmdStrLen,
+		Arity:    2,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "INCR",
+		Proc:     cmdIncr,
+		Arity:    2,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "DECR",
+		Proc:     cmdDecr,
+		Arity:    2,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "INCRBY",
+		Proc:     cmdIncrBy,
+		Arity:    3,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "DECRBY",
+		Proc:     cmdDecrBy,
+		Arity:    3,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "GETRANGE",
+		Proc:     cmdGetRange,
+		Arity:    4,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "SETRANGE",
+		Proc:     cmdSetRange,
+		Arity:    4,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "SETBIT",
+		Proc:     cmdSetBit,
+		Arity:    4,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "GETBIT",
+		Proc:     cmdGetBit,
+		Arity:    3,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "BITCOUNT",
+		Proc:     cmdBitCount,
+		Arity:    -2,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "BITOP",
+		Proc:     cmdBitOp,
+		Arity:    -4,
+		Category: "string",
+	})
+
+	ct.Register(&Command{
+		Name:     "BITPOS",
+		Proc:     cmdBitPos,
+		Arity:    -3,
 		Category: "string",
 	})
 
@@ -524,6 +909,28 @@ func (ct *CommandTable) registerCommands() {
 		Proc:     cmdCluster,
 		Arity:    -2,
 		Category: "cluster",
+	})
+
+	// ========== 复制命令 ==========
+	ct.Register(&Command{
+		Name:     "REPLCONF",
+		Proc:     cmdReplConf,
+		Arity:    -2,
+		Category: "replication",
+	})
+
+	ct.Register(&Command{
+		Name:     "PSYNC",
+		Proc:     cmdPSync,
+		Arity:    -2,
+		Category: "replication",
+	})
+
+	ct.Register(&Command{
+		Name:     "SLAVEOF",
+		Proc:     cmdSlaveOf,
+		Arity:    -3,
+		Category: "replication",
 	})
 
 	// ========== AOF 命令 ==========

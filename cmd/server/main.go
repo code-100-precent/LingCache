@@ -38,6 +38,17 @@ func main() {
 		fmt.Printf("Warning: Failed to initialize AOF: %v\n", err)
 	}
 
+	// 初始化集群（如果启用）
+	if config.ClusterEnabled {
+		clusterAddr := fmt.Sprintf("%s", *addr)
+		if config.ClusterPort > 0 {
+			clusterAddr = fmt.Sprintf(":%d", config.ClusterPort)
+		}
+		if err := srv.InitCluster(true, config.ClusterNodeID, clusterAddr); err != nil {
+			fmt.Printf("Warning: Failed to initialize cluster: %v\n", err)
+		}
+	}
+
 	// 处理信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
