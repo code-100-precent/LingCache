@@ -12,7 +12,7 @@ package structure
 // Encoding 通用编码类型
 type Encoding byte
 
-// 编码类型常量（Redis 实际使用的值）
+// 编码类型常量
 const (
 	// 通用编码
 	OBJ_ENCODING_RAW        Encoding = 0  // 原始字符串（SDS）

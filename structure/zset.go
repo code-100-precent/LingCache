@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"math/rand"
+	"strconv"
 )
 
 /*
@@ -112,14 +113,9 @@ type SkipList struct {
 // RedisZSet Redis Sorted Set 对象
 type RedisZSet struct {
 	encoding ZSetEncoding
-	listpack *ZSetListpack      // 小集合使用
+	listpack *ListpackFull      // 小集合使用 ListpackFull（存储 member-score 对，按 score 排序）
 	skiplist *SkipList          // 大集合使用
 	dict     map[string]float64 // member -> score 映射（简化实现）
-}
-
-// ZSetListpack 有序集合的 listpack（简化实现）
-type ZSetListpack struct {
-	entries []ZSetEntry // (member, score) 对，按 score 排序
 }
 
 // ZSetEntry 有序集合条目
@@ -142,9 +138,7 @@ func (e *ZSetEntry) Score() float64 {
 func NewZSet() *RedisZSet {
 	return &RedisZSet{
 		encoding: OBJ_ENCODING_LISTPACK,
-		listpack: &ZSetListpack{
-			entries: make([]ZSetEntry, 0),
-		},
+		listpack: NewListpackFull(256),
 		skiplist: nil,
 		dict:     nil,
 	}
@@ -161,32 +155,249 @@ func (rz *RedisZSet) Add(member []byte, score float64) error {
 
 // addListpack 向 listpack 添加元素
 func (rz *RedisZSet) addListpack(member []byte, score float64) error {
-	// 检查是否需要转换
-	if len(rz.listpack.entries) >= ZSET_MAX_LISTPACK_ENTRIES ||
+	if rz.listpack == nil {
+		rz.listpack = NewListpackFull(256)
+	}
+
+	// 检查是否需要转换（listpack 中 member-score 对算作 2 个元素）
+	if rz.listpack.Length()/2 >= ZSET_MAX_LISTPACK_ENTRIES ||
 		len(member) > ZSET_MAX_LISTPACK_VALUE {
 		rz.convertToSkiplist()
 		return rz.addSkiplist(member, score)
 	}
 
 	// 查找插入位置（保持有序）
-	idx := rz.findInsertPosition(score, member)
+	insertIdx := rz.findInsertPositionInListpack(score, member)
 
 	// 检查是否已存在
-	if idx < len(rz.listpack.entries) &&
-		rz.listpack.entries[idx].score == score &&
-		bytes.Equal(rz.listpack.entries[idx].member, member) {
-		// 更新 score
-		rz.listpack.entries[idx].score = score
+	if insertIdx >= 0 && insertIdx < int(rz.listpack.Length()/2) {
+		// 检查该位置的 member 是否匹配
+		if rz.getMemberAt(insertIdx) != nil && bytes.Equal(rz.getMemberAt(insertIdx), member) {
+			// 更新 score
+			rz.updateScoreAt(insertIdx, score)
+			return nil
+		}
+	}
+
+	// 插入新元素（需要重建 listpack）
+	rz.insertAtPosition(insertIdx, member, score)
+
+	return nil
+}
+
+// findInsertPositionInListpack 查找插入位置（返回 member 的索引位置）
+func (rz *RedisZSet) findInsertPositionInListpack(score float64, member []byte) int {
+	if rz.listpack == nil || rz.listpack.Length() == 0 {
+		return 0
+	}
+
+	// 二分查找
+	left, right := 0, int(rz.listpack.Length()/2)
+
+	for left < right {
+		mid := (left + right) / 2
+		midScore := rz.getScoreAt(mid)
+
+		if midScore < score {
+			left = mid + 1
+		} else if midScore > score {
+			right = mid
+		} else {
+			// score 相同，按 member 字典序
+			midMember := rz.getMemberAt(mid)
+			cmp := bytes.Compare(midMember, member)
+			if cmp < 0 {
+				left = mid + 1
+			} else {
+				right = mid
+			}
+		}
+	}
+
+	return left
+}
+
+// getMemberAt 获取指定位置的 member
+func (rz *RedisZSet) getMemberAt(idx int) []byte {
+	if rz.listpack == nil {
 		return nil
 	}
 
-	// 插入新元素
-	entry := ZSetEntry{member: member, score: score}
-	rz.listpack.entries = append(rz.listpack.entries, ZSetEntry{})
-	copy(rz.listpack.entries[idx+1:], rz.listpack.entries[idx:])
-	rz.listpack.entries[idx] = entry
+	p := rz.listpack.First()
+	currentIdx := 0
 
-	return nil
+	for p != nil && currentIdx < idx*2 {
+		var err error
+		p, err = rz.listpack.Next(p)
+		if err != nil || p == nil {
+			return nil
+		}
+		currentIdx++
+	}
+
+	if p == nil {
+		return nil
+	}
+
+	sval, _, isInt, err := rz.listpack.GetValue(p)
+	if err != nil || isInt {
+		return nil
+	}
+
+	return sval
+}
+
+// getScoreAt 获取指定位置的 score
+func (rz *RedisZSet) getScoreAt(idx int) float64 {
+	if rz.listpack == nil {
+		return 0
+	}
+
+	// score 在 member 之后（idx*2+1 的位置）
+	p := rz.listpack.First()
+	currentIdx := 0
+
+	for p != nil && currentIdx < idx*2+1 {
+		var err error
+		p, err = rz.listpack.Next(p)
+		if err != nil || p == nil {
+			return 0
+		}
+		currentIdx++
+	}
+
+	if p == nil {
+		return 0
+	}
+
+	sval, ival, isInt, err := rz.listpack.GetValue(p)
+	if err != nil {
+		return 0
+	}
+
+	// 解析 score（存储为字符串）
+	if isInt {
+		return float64(ival)
+	}
+	score, err := strconv.ParseFloat(string(sval), 64)
+	if err != nil {
+		return 0
+	}
+	return score
+}
+
+// updateScoreAt 更新指定位置的 score
+func (rz *RedisZSet) updateScoreAt(idx int, newScore float64) {
+	// 收集所有元素
+	entries := make([]ZSetEntry, 0, rz.listpack.Length()/2)
+
+	p := rz.listpack.First()
+	currentIdx := 0
+	var currentMember []byte
+
+	for p != nil {
+		sval, _, _, err := rz.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if currentIdx%2 == 0 {
+			// member
+			currentMember = sval
+		} else {
+			// score
+			score := rz.parseScore(sval)
+			if currentIdx/2 == idx {
+				// 更新这个位置的 score
+				entries = append(entries, ZSetEntry{
+					member: currentMember,
+					score:  newScore,
+				})
+			} else {
+				entries = append(entries, ZSetEntry{
+					member: currentMember,
+					score:  score,
+				})
+			}
+		}
+
+		var nextErr error
+		p, nextErr = rz.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		currentIdx++
+	}
+
+	// 重建 listpack
+	rz.listpack = NewListpackFull(256)
+	for _, entry := range entries {
+		rz.listpack.AppendString(entry.member)
+		rz.listpack.AppendString(rz.scoreToBytes(entry.score))
+	}
+}
+
+// insertAtPosition 在指定位置插入元素
+func (rz *RedisZSet) insertAtPosition(idx int, member []byte, score float64) {
+	// 收集所有元素
+	entries := make([]ZSetEntry, 0, rz.listpack.Length()/2+1)
+
+	p := rz.listpack.First()
+	currentIdx := 0
+	var currentMember []byte
+
+	for p != nil {
+		sval, _, _, err := rz.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if currentIdx%2 == 0 {
+			// member
+			currentMember = sval
+		} else {
+			// score
+			score := rz.parseScore(sval)
+			entries = append(entries, ZSetEntry{
+				member: currentMember,
+				score:  score,
+			})
+		}
+
+		var nextErr error
+		p, nextErr = rz.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		currentIdx++
+	}
+
+	// 插入新元素
+	newEntry := ZSetEntry{member: member, score: score}
+	entries = append(entries, ZSetEntry{})
+	copy(entries[idx+1:], entries[idx:])
+	entries[idx] = newEntry
+
+	// 重建 listpack
+	rz.listpack = NewListpackFull(256)
+	for _, entry := range entries {
+		rz.listpack.AppendString(entry.member)
+		rz.listpack.AppendString(rz.scoreToBytes(entry.score))
+	}
+}
+
+// parseScore 解析 score 字符串
+func (rz *RedisZSet) parseScore(data []byte) float64 {
+	score, err := strconv.ParseFloat(string(data), 64)
+	if err != nil {
+		return 0
+	}
+	return score
+}
+
+// scoreToBytes 将 score 转换为字节数组
+func (rz *RedisZSet) scoreToBytes(score float64) []byte {
+	return []byte(strconv.FormatFloat(score, 'f', -1, 64))
 }
 
 // addSkiplist 向 skiplist 添加元素
@@ -227,15 +438,90 @@ func (rz *RedisZSet) Remove(member []byte) error {
 
 // removeListpack 从 listpack 删除元素
 func (rz *RedisZSet) removeListpack(member []byte) error {
-	for i, entry := range rz.listpack.entries {
-		if bytes.Equal(entry.member, member) {
-			// 删除元素
-			copy(rz.listpack.entries[i:], rz.listpack.entries[i+1:])
-			rz.listpack.entries = rz.listpack.entries[:len(rz.listpack.entries)-1]
-			return nil
-		}
+	if rz.listpack == nil {
+		return errors.New("member not found")
 	}
-	return errors.New("member not found")
+
+	// 查找 member 的位置
+	memberIdx := -1
+	p := rz.listpack.First()
+	idx := 0
+
+	for p != nil {
+		sval, _, isInt, err := rz.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		// 只检查 member（偶数索引）
+		if idx%2 == 0 && !isInt && bytes.Equal(sval, member) {
+			memberIdx = idx / 2
+			break
+		}
+
+		var nextErr error
+		p, nextErr = rz.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
+	if memberIdx < 0 {
+		return errors.New("member not found")
+	}
+
+	// 收集所有元素，跳过要删除的
+	entries := make([]ZSetEntry, 0, rz.listpack.Length()/2-1)
+
+	p = rz.listpack.First()
+	idx = 0
+	var currentMember []byte
+
+	for p != nil {
+		sval, _, _, err := rz.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if idx%2 == 0 {
+			// member
+			if idx/2 == memberIdx {
+				// 跳过这个 member 和它的 score
+				var nextErr error
+				p, nextErr = rz.listpack.Next(p)
+				if nextErr != nil || p == nil {
+					break
+				}
+				idx++ // 跳过 score
+				continue
+			}
+			currentMember = sval
+		} else {
+			// score
+			score := rz.parseScore(sval)
+			entries = append(entries, ZSetEntry{
+				member: currentMember,
+				score:  score,
+			})
+		}
+
+		var nextErr error
+		p, nextErr = rz.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
+	// 重建 listpack
+	rz.listpack = NewListpackFull(256)
+	for _, entry := range entries {
+		rz.listpack.AppendString(entry.member)
+		rz.listpack.AppendString(rz.scoreToBytes(entry.score))
+	}
+
+	return nil
 }
 
 // removeSkiplist 从 skiplist 删除元素
@@ -262,11 +548,39 @@ func (rz *RedisZSet) Score(member []byte) (float64, bool) {
 
 // scoreListpack 从 listpack 获取 score
 func (rz *RedisZSet) scoreListpack(member []byte) (float64, bool) {
-	for _, entry := range rz.listpack.entries {
-		if bytes.Equal(entry.member, member) {
-			return entry.score, true
-		}
+	if rz.listpack == nil {
+		return 0, false
 	}
+
+	p := rz.listpack.First()
+	idx := 0
+	var currentMember []byte
+
+	for p != nil {
+		sval, _, _, err := rz.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if idx%2 == 0 {
+			// member
+			currentMember = sval
+		} else {
+			// score
+			if bytes.Equal(currentMember, member) {
+				return rz.parseScore(sval), true
+			}
+		}
+
+		var nextErr error
+		p, nextErr = rz.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+		idx++
+	}
+
 	return 0, false
 }
 
@@ -287,14 +601,41 @@ func (rz *RedisZSet) Rank(member []byte, reverse bool) (int, bool) {
 
 // rankListpack 从 listpack 获取排名
 func (rz *RedisZSet) rankListpack(member []byte, reverse bool) (int, bool) {
-	for i, entry := range rz.listpack.entries {
-		if bytes.Equal(entry.member, member) {
-			if reverse {
-				return len(rz.listpack.entries) - 1 - i, true
-			}
-			return i, true
-		}
+	if rz.listpack == nil {
+		return 0, false
 	}
+
+	p := rz.listpack.First()
+	idx := 0
+	rank := 0
+
+	for p != nil {
+		sval, _, _, err := rz.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		// 只检查 member（偶数索引）
+		if idx%2 == 0 && bytes.Equal(sval, member) {
+			if reverse {
+				return int(rz.listpack.Length()/2) - 1 - rank, true
+			}
+			return rank, true
+		}
+
+		if idx%2 == 1 {
+			// 完成一个 member-score 对
+			rank++
+		}
+
+		var nextErr error
+		p, nextErr = rz.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
 	return 0, false
 }
 
@@ -335,7 +676,11 @@ func (rz *RedisZSet) Range(start, end int, reverse bool) ([]ZSetEntry, error) {
 
 // rangeListpack 从 listpack 获取范围
 func (rz *RedisZSet) rangeListpack(start, end int, reverse bool) ([]ZSetEntry, error) {
-	length := len(rz.listpack.entries)
+	if rz.listpack == nil {
+		return []ZSetEntry{}, nil
+	}
+
+	length := int(rz.listpack.Length() / 2)
 
 	// 处理负数索引
 	if start < 0 {
@@ -357,13 +702,75 @@ func (rz *RedisZSet) rangeListpack(start, end int, reverse bool) ([]ZSetEntry, e
 	}
 
 	result := make([]ZSetEntry, 0, end-start+1)
+
 	if reverse {
+		// 反向遍历
+		entries := make([]ZSetEntry, 0, length)
+		p := rz.listpack.First()
+		idx := 0
+		var currentMember []byte
+
+		for p != nil {
+			sval, _, _, err := rz.listpack.GetValue(p)
+			if err != nil {
+				break
+			}
+
+			if idx%2 == 0 {
+				currentMember = sval
+			} else {
+				score := rz.parseScore(sval)
+				entries = append(entries, ZSetEntry{
+					member: currentMember,
+					score:  score,
+				})
+			}
+
+			var nextErr error
+			p, nextErr = rz.listpack.Next(p)
+			if nextErr != nil || p == nil {
+				break
+			}
+			idx++
+		}
+
 		for i := end; i >= start; i-- {
-			result = append(result, rz.listpack.entries[i])
+			if i < len(entries) {
+				result = append(result, entries[i])
+			}
 		}
 	} else {
-		for i := start; i <= end; i++ {
-			result = append(result, rz.listpack.entries[i])
+		// 正向遍历
+		p := rz.listpack.First()
+		idx := 0
+		rank := 0
+		var currentMember []byte
+
+		for p != nil && rank <= end {
+			sval, _, _, err := rz.listpack.GetValue(p)
+			if err != nil {
+				break
+			}
+
+			if idx%2 == 0 {
+				currentMember = sval
+			} else {
+				score := rz.parseScore(sval)
+				if rank >= start {
+					result = append(result, ZSetEntry{
+						member: currentMember,
+						score:  score,
+					})
+				}
+				rank++
+			}
+
+			var nextErr error
+			p, nextErr = rz.listpack.Next(p)
+			if nextErr != nil || p == nil {
+				break
+			}
+			idx++
 		}
 	}
 
@@ -428,31 +835,6 @@ func (rz *RedisZSet) rangeSkiplist(start, end int, reverse bool) ([]ZSetEntry, e
 	return result, nil
 }
 
-// findInsertPosition 查找插入位置（保持有序）
-func (rz *RedisZSet) findInsertPosition(score float64, member []byte) int {
-	entries := rz.listpack.entries
-	left, right := 0, len(entries)
-
-	for left < right {
-		mid := (left + right) / 2
-		if entries[mid].score < score {
-			left = mid + 1
-		} else if entries[mid].score > score {
-			right = mid
-		} else {
-			// score 相同，按 member 字典序
-			cmp := bytes.Compare(entries[mid].member, member)
-			if cmp < 0 {
-				left = mid + 1
-			} else {
-				right = mid
-			}
-		}
-	}
-
-	return left
-}
-
 // convertToSkiplist 转换为 skiplist
 func (rz *RedisZSet) convertToSkiplist() {
 	if rz.encoding == OBJ_ENCODING_SKIPLIST {
@@ -463,9 +845,34 @@ func (rz *RedisZSet) convertToSkiplist() {
 	rz.dict = make(map[string]float64)
 
 	// 将 listpack 中的所有元素添加到 skiplist
-	for _, entry := range rz.listpack.entries {
-		rz.skiplist.Insert(entry.member, entry.score)
-		rz.dict[string(entry.member)] = entry.score
+	if rz.listpack != nil {
+		p := rz.listpack.First()
+		idx := 0
+		var currentMember []byte
+
+		for p != nil {
+			sval, _, _, err := rz.listpack.GetValue(p)
+			if err != nil {
+				break
+			}
+
+			if idx%2 == 0 {
+				// member
+				currentMember = sval
+			} else {
+				// score
+				score := rz.parseScore(sval)
+				rz.skiplist.Insert(currentMember, score)
+				rz.dict[string(currentMember)] = score
+			}
+
+			var nextErr error
+			p, nextErr = rz.listpack.Next(p)
+			if nextErr != nil || p == nil {
+				break
+			}
+			idx++
+		}
 	}
 
 	rz.encoding = OBJ_ENCODING_SKIPLIST
@@ -475,7 +882,11 @@ func (rz *RedisZSet) convertToSkiplist() {
 // Card 获取 ZSet 的元素数量
 func (rz *RedisZSet) Card() int {
 	if rz.encoding == OBJ_ENCODING_LISTPACK {
-		return len(rz.listpack.entries)
+		if rz.listpack == nil {
+			return 0
+		}
+		// listpack 中 member-score 成对存储，所以长度除以 2
+		return int(rz.listpack.Length() / 2)
 	} else {
 		return int(rz.skiplist.length)
 	}

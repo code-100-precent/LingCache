@@ -290,7 +290,22 @@ func NewSDSFromBytes(init []byte) SDS {
 
 // NewSDSEmpty 创建空的 SDS
 func NewSDSEmpty() SDS {
-	return NewSDS("")
+	// 直接创建空的 SDS，避免递归调用
+	sdsType := SDS_TYPE_8
+	hdrSize := sdsHdrSize(sdsType)
+
+	// 分配内存：头部 + \0
+	totalSize := hdrSize + 1
+	buf := make([]byte, totalSize)
+
+	// 设置头部
+	hdr := (*sdshdr8)(unsafe.Pointer(&buf[0]))
+	hdr.len = 0
+	hdr.alloc = 0
+	hdr.flags = byte(sdsType)
+	buf[totalSize-1] = 0 // \0 结尾
+
+	return (*byte)(unsafe.Pointer(&buf[hdrSize]))
 }
 
 // SDSCat 连接字符串到 SDS（实现空间预分配）

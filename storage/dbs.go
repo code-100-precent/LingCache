@@ -266,6 +266,14 @@ func (db *RedisDb) DBSize() int {
 	return count
 }
 
+// ExpiresCount 获取有过期时间的键数量
+func (db *RedisDb) ExpiresCount() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	return len(db.expires)
+}
+
 // FlushDB 清空数据库
 func (db *RedisDb) FlushDB() {
 	db.mu.Lock()

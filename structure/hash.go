@@ -98,7 +98,7 @@ func (e *HashEntry) Value() []byte {
 // RedisHash Redis Hash 对象
 type RedisHash struct {
 	encoding  HashEncoding
-	listpack  []HashEntry       // 小哈希表使用（简化实现）
+	listpack  *ListpackFull     // 小哈希表使用 ListpackFull（存储 field-value 对）
 	hashtable map[string][]byte // 大哈希表使用（简化实现，实际使用 dict）
 }
 
@@ -106,7 +106,7 @@ type RedisHash struct {
 func NewHash() *RedisHash {
 	return &RedisHash{
 		encoding:  OBJ_ENCODING_LISTPACK,
-		listpack:  make([]HashEntry, 0),
+		listpack:  NewListpackFull(256),
 		hashtable: nil,
 	}
 }
@@ -122,29 +122,110 @@ func (rh *RedisHash) Set(field, value []byte) error {
 
 // setListpack 在 listpack 中设置字段
 func (rh *RedisHash) setListpack(field, value []byte) error {
-	// 检查是否需要转换
-	if len(rh.listpack) >= HASH_MAX_LISTPACK_ENTRIES ||
+	if rh.listpack == nil {
+		rh.listpack = NewListpackFull(256)
+	}
+
+	// 检查是否需要转换（listpack 中 field-value 对算作 2 个元素）
+	if rh.listpack.Length()/2 >= HASH_MAX_LISTPACK_ENTRIES ||
 		len(field) > HASH_MAX_LISTPACK_VALUE ||
 		len(value) > HASH_MAX_LISTPACK_VALUE {
 		rh.convertToHashtable()
 		return rh.setHashtable(field, value)
 	}
 
-	// 查找字段是否存在
-	idx := rh.findField(field)
+	// 查找字段是否存在（field-value 成对存储）
+	fieldIdx := rh.findFieldInListpack(field)
 
-	if idx >= 0 {
-		// 更新现有字段
-		rh.listpack[idx].value = value
+	if fieldIdx >= 0 {
+		// 更新现有字段的值（fieldIdx 是 field 的位置，fieldIdx+1 是 value 的位置）
+		// 需要重建 listpack 来更新值
+		rh.updateFieldValue(fieldIdx, value)
 	} else {
-		// 添加新字段
-		rh.listpack = append(rh.listpack, HashEntry{
-			field: field,
-			value: value,
-		})
+		// 添加新字段（field 和 value 都追加）
+		rh.listpack.AppendString(field)
+		rh.listpack.AppendString(value)
 	}
 
 	return nil
+}
+
+// findFieldInListpack 在 listpack 中查找字段（返回 field 的索引位置，-1 表示不存在）
+func (rh *RedisHash) findFieldInListpack(field []byte) int {
+	if rh.listpack == nil {
+		return -1
+	}
+
+	idx := 0
+	p := rh.listpack.First()
+	for p != nil {
+		sval, _, isInt, err := rh.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+		// 只检查 field（偶数索引位置）
+		if idx%2 == 0 && !isInt && bytes.Equal(sval, field) {
+			return idx
+		}
+		var nextErr error
+		p, nextErr = rh.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
+	return -1
+}
+
+// updateFieldValue 更新字段的值（需要重建 listpack）
+func (rh *RedisHash) updateFieldValue(fieldIdx int, newValue []byte) {
+	// 收集所有 field-value 对
+	entries := make([]HashEntry, 0, rh.listpack.Length()/2)
+
+	p := rh.listpack.First()
+	idx := 0
+	var currentField []byte
+
+	for p != nil {
+		sval, _, _, err := rh.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if idx%2 == 0 {
+			// field
+			currentField = sval
+		} else {
+			// value
+			if idx == fieldIdx+1 {
+				// 这是要更新的值
+				entries = append(entries, HashEntry{
+					field: currentField,
+					value: newValue,
+				})
+			} else {
+				entries = append(entries, HashEntry{
+					field: currentField,
+					value: sval,
+				})
+			}
+		}
+
+		var nextErr error
+		p, nextErr = rh.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
+	// 重建 listpack
+	rh.listpack = NewListpackFull(256)
+	for _, entry := range entries {
+		rh.listpack.AppendString(entry.field)
+		rh.listpack.AppendString(entry.value)
+	}
 }
 
 // setHashtable 在 hashtable 中设置字段
@@ -172,10 +253,40 @@ func (rh *RedisHash) Get(field []byte) ([]byte, bool) {
 
 // getListpack 从 listpack 获取字段
 func (rh *RedisHash) getListpack(field []byte) ([]byte, bool) {
-	idx := rh.findField(field)
-	if idx >= 0 {
-		return rh.listpack[idx].value, true
+	if rh.listpack == nil {
+		return nil, false
 	}
+
+	fieldIdx := rh.findFieldInListpack(field)
+	if fieldIdx < 0 {
+		return nil, false
+	}
+
+	// fieldIdx 是 field 的位置，fieldIdx+1 是 value 的位置
+	// 需要找到 value
+	p := rh.listpack.First()
+	idx := 0
+	for p != nil && idx <= fieldIdx+1 {
+		if idx == fieldIdx+1 {
+			// 这是 value
+			sval, ival, isInt, err := rh.listpack.GetValue(p)
+			if err != nil {
+				return nil, false
+			}
+			if isInt {
+				// 整数转换为字符串
+				return rh.intToBytes(ival), true
+			}
+			return sval, true
+		}
+		var err error
+		p, err = rh.listpack.Next(p)
+		if err != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
 	return nil, false
 }
 
@@ -205,14 +316,63 @@ func (rh *RedisHash) Del(field []byte) error {
 
 // delListpack 从 listpack 删除字段
 func (rh *RedisHash) delListpack(field []byte) error {
-	idx := rh.findField(field)
-	if idx < 0 {
+	if rh.listpack == nil {
 		return errors.New("field not found")
 	}
 
-	// 删除元素
-	copy(rh.listpack[idx:], rh.listpack[idx+1:])
-	rh.listpack = rh.listpack[:len(rh.listpack)-1]
+	fieldIdx := rh.findFieldInListpack(field)
+	if fieldIdx < 0 {
+		return errors.New("field not found")
+	}
+
+	// 收集所有 field-value 对，跳过要删除的
+	entries := make([]HashEntry, 0, rh.listpack.Length()/2)
+
+	p := rh.listpack.First()
+	idx := 0
+	var currentField []byte
+
+	for p != nil {
+		sval, _, _, err := rh.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if idx%2 == 0 {
+			// field
+			if idx == fieldIdx {
+				// 跳过这个 field 和它的 value
+				var nextErr error
+				p, nextErr = rh.listpack.Next(p)
+				if nextErr != nil || p == nil {
+					break
+				}
+				idx++ // 跳过 value
+				continue
+			}
+			currentField = sval
+		} else {
+			// value
+			entries = append(entries, HashEntry{
+				field: currentField,
+				value: sval,
+			})
+		}
+
+		var nextErr error
+		p, nextErr = rh.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
+	// 重建 listpack
+	rh.listpack = NewListpackFull(256)
+	for _, entry := range entries {
+		rh.listpack.AppendString(entry.field)
+		rh.listpack.AppendString(entry.value)
+	}
 
 	return nil
 }
@@ -234,7 +394,7 @@ func (rh *RedisHash) delHashtable(field []byte) error {
 // Exists 检查字段是否存在
 func (rh *RedisHash) Exists(field []byte) bool {
 	if rh.encoding == OBJ_ENCODING_LISTPACK {
-		return rh.findField(field) >= 0
+		return rh.findFieldInListpack(field) >= 0
 	} else {
 		if rh.hashtable == nil {
 			return false
@@ -242,16 +402,6 @@ func (rh *RedisHash) Exists(field []byte) bool {
 		_, exists := rh.hashtable[string(field)]
 		return exists
 	}
-}
-
-// findField 在 listpack 中查找字段（返回索引）
-func (rh *RedisHash) findField(field []byte) int {
-	for i, entry := range rh.listpack {
-		if bytes.Equal(entry.field, field) {
-			return i
-		}
-	}
-	return -1
 }
 
 // convertToHashtable 转换为 hashtable
@@ -263,10 +413,34 @@ func (rh *RedisHash) convertToHashtable() {
 	rh.hashtable = make(map[string][]byte)
 
 	// 将 listpack 中的所有字段添加到 hashtable
-	for _, entry := range rh.listpack {
-		valueCopy := make([]byte, len(entry.value))
-		copy(valueCopy, entry.value)
-		rh.hashtable[string(entry.field)] = valueCopy
+	if rh.listpack != nil {
+		p := rh.listpack.First()
+		idx := 0
+		var currentField []byte
+
+		for p != nil {
+			sval, _, _, err := rh.listpack.GetValue(p)
+			if err != nil {
+				break
+			}
+
+			if idx%2 == 0 {
+				// field
+				currentField = sval
+			} else {
+				// value
+				valueCopy := make([]byte, len(sval))
+				copy(valueCopy, sval)
+				rh.hashtable[string(currentField)] = valueCopy
+			}
+
+			var nextErr error
+			p, nextErr = rh.listpack.Next(p)
+			if nextErr != nil || p == nil {
+				break
+			}
+			idx++
+		}
 	}
 
 	rh.encoding = OBJ_ENCODING_HT
@@ -276,7 +450,11 @@ func (rh *RedisHash) convertToHashtable() {
 // Len 获取字段数量
 func (rh *RedisHash) Len() int {
 	if rh.encoding == OBJ_ENCODING_LISTPACK {
-		return len(rh.listpack)
+		if rh.listpack == nil {
+			return 0
+		}
+		// listpack 中 field-value 成对存储，所以长度除以 2
+		return int(rh.listpack.Length()) / 2
 	} else {
 		return len(rh.hashtable)
 	}
@@ -293,18 +471,43 @@ func (rh *RedisHash) GetAll() []HashEntry {
 
 // getAllListpack 从 listpack 获取所有字段
 func (rh *RedisHash) getAllListpack() []HashEntry {
-	result := make([]HashEntry, 0, len(rh.listpack))
-	for _, entry := range rh.listpack {
-		// 返回副本
-		fieldCopy := make([]byte, len(entry.field))
-		copy(fieldCopy, entry.field)
-		valueCopy := make([]byte, len(entry.value))
-		copy(valueCopy, entry.value)
-		result = append(result, HashEntry{
-			field: fieldCopy,
-			value: valueCopy,
-		})
+	if rh.listpack == nil {
+		return []HashEntry{}
 	}
+
+	result := make([]HashEntry, 0, rh.listpack.Length()/2)
+	p := rh.listpack.First()
+	idx := 0
+	var currentField []byte
+
+	for p != nil {
+		sval, _, _, err := rh.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		if idx%2 == 0 {
+			// field
+			currentField = make([]byte, len(sval))
+			copy(currentField, sval)
+		} else {
+			// value
+			valueCopy := make([]byte, len(sval))
+			copy(valueCopy, sval)
+			result = append(result, HashEntry{
+				field: currentField,
+				value: valueCopy,
+			})
+		}
+
+		var nextErr error
+		p, nextErr = rh.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
 	return result
 }
 
@@ -338,12 +541,35 @@ func (rh *RedisHash) Keys() [][]byte {
 
 // keysListpack 从 listpack 获取所有字段名
 func (rh *RedisHash) keysListpack() [][]byte {
-	result := make([][]byte, 0, len(rh.listpack))
-	for _, entry := range rh.listpack {
-		fieldCopy := make([]byte, len(entry.field))
-		copy(fieldCopy, entry.field)
-		result = append(result, fieldCopy)
+	if rh.listpack == nil {
+		return [][]byte{}
 	}
+
+	result := make([][]byte, 0, rh.listpack.Length()/2)
+	p := rh.listpack.First()
+	idx := 0
+
+	for p != nil {
+		sval, _, isInt, err := rh.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		// 只收集 field（偶数索引）
+		if idx%2 == 0 && !isInt {
+			fieldCopy := make([]byte, len(sval))
+			copy(fieldCopy, sval)
+			result = append(result, fieldCopy)
+		}
+
+		var nextErr error
+		p, nextErr = rh.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
 	return result
 }
 
@@ -371,12 +597,35 @@ func (rh *RedisHash) Values() [][]byte {
 
 // valuesListpack 从 listpack 获取所有字段值
 func (rh *RedisHash) valuesListpack() [][]byte {
-	result := make([][]byte, 0, len(rh.listpack))
-	for _, entry := range rh.listpack {
-		valueCopy := make([]byte, len(entry.value))
-		copy(valueCopy, entry.value)
-		result = append(result, valueCopy)
+	if rh.listpack == nil {
+		return [][]byte{}
 	}
+
+	result := make([][]byte, 0, rh.listpack.Length()/2)
+	p := rh.listpack.First()
+	idx := 0
+
+	for p != nil {
+		sval, _, _, err := rh.listpack.GetValue(p)
+		if err != nil {
+			break
+		}
+
+		// 只收集 value（奇数索引）
+		if idx%2 == 1 {
+			valueCopy := make([]byte, len(sval))
+			copy(valueCopy, sval)
+			result = append(result, valueCopy)
+		}
+
+		var nextErr error
+		p, nextErr = rh.listpack.Next(p)
+		if nextErr != nil || p == nil {
+			break
+		}
+		idx++
+	}
+
 	return result
 }
 
@@ -493,7 +742,7 @@ func (rh *RedisHash) parseFloat(data []byte) (float64, error) {
 	return 0, errors.New("invalid float")
 }
 
-// intToBytes 整数转字节数组
+// intToBytes 整数转字节数组（辅助函数，用于从 listpack 获取整数时转换）
 func (rh *RedisHash) intToBytes(val int64) []byte {
 	if val == 0 {
 		return []byte("0")
