@@ -338,8 +338,6 @@ func (s *Server) handleClient(client *Client) {
 				if err := s.aofWriter.Append(req); err != nil {
 					// AOF 写入失败，记录错误但不影响命令执行
 					fmt.Printf("AOF write error: %v\n", err)
-				} else {
-					fmt.Printf("AOF written: %s\n", cmdName)
 				}
 			}
 		}
